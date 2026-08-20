@@ -56,6 +56,7 @@ def partition_for_task(task: str) -> str:
 MINIMAX_H3_FINITE_ASPECT_RATIOS = (
     "21:9",
     "16:9",
+    "7:4",
     "4:3",
     "1:1",
     "3:4",

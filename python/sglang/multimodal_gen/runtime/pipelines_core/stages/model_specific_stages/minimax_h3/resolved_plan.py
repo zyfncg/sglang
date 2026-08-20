@@ -40,7 +40,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 
 MINIMAX_H3_SHAPE_POLICY_VERSION = "adapt_shape_v1"
 MINIMAX_H3_BASE_SHORT_EDGE = 768
-MINIMAX_H3_MAX_PIXELS = MINIMAX_H3_BASE_SHORT_EDGE * 1344
+MINIMAX_H3_MAX_PIXELS = 1536 * 864
 MINIMAX_H3_CANVAS_MULTIPLE = 32
 MINIMAX_H3_MIN_ASPECT_RATIO = 1.0 / 4.0
 MINIMAX_H3_MAX_ASPECT_RATIO = 4.0
@@ -100,10 +100,11 @@ def _validate_base_short_edge(value: Any) -> int:
     try:
         short_edge = int(value)
     except (TypeError, ValueError) as exc:
-        raise ValueError("target.short_edge must be 768") from exc
-    if short_edge != MINIMAX_H3_BASE_SHORT_EDGE or value != short_edge:
+        raise ValueError("target.short_edge must be an integer") from exc
+    if not 768 <= short_edge <= 1024 or short_edge % 32 or value != short_edge:
         raise ValueError(
-            f"target.short_edge must be 768 for MiniMax H3 shape policy v2, got {value!r}"
+            "target.short_edge must be a multiple of 32 in [768, 1024], "
+            f"got {value!r}"
         )
     return short_edge
 
@@ -153,10 +154,15 @@ def minimax_h3_resolve_spatial_shape(
     else:
         nominal_width = float(base_short_edge)
         nominal_height = float(base_short_edge) / ratio
+    max_pixels = (
+        MINIMAX_H3_BASE_SHORT_EDGE * 1344
+        if base_short_edge == MINIMAX_H3_BASE_SHORT_EDGE
+        else MINIMAX_H3_MAX_PIXELS
+    )
     nominal_area = nominal_width * nominal_height
-    if nominal_area > MINIMAX_H3_MAX_PIXELS:
+    if nominal_area > max_pixels:
         size_mode = "area"
-        scale = math.sqrt(float(MINIMAX_H3_MAX_PIXELS) / nominal_area)
+        scale = math.sqrt(float(max_pixels) / nominal_area)
         nominal_width *= scale
         nominal_height *= scale
     else:
@@ -171,7 +177,7 @@ def minimax_h3_resolve_spatial_shape(
         "base_short_edge": base_short_edge,
         "effective_short_edge": min(resolved_width, resolved_height),
         "size_mode": size_mode,
-        "max_pixels": MINIMAX_H3_MAX_PIXELS,
+        "max_pixels": max_pixels,
         "multiple": MINIMAX_H3_CANVAS_MULTIPLE,
         "rounding": "nearest",
         "width": resolved_width,

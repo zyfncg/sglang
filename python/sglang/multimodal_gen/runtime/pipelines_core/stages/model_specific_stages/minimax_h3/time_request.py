@@ -41,19 +41,17 @@ def minimax_h3_time_shift_sigmas(
 
     import torch
 
-    # The rectified-flow sigma range is fixed at [1.0, 0.0].
-    base = torch.linspace(
-        1.0,
-        0.0,
+    # Use the validated `simple` scheduler over the model's 1000-point
+    # discrete-flow table. `num_steps` is the number of model evaluations;
+    # the terminal zero is appended below as the final solver boundary.
+    table_size = 1000
+    sample = torch.arange(int(num_steps), device="cpu", dtype=torch.int64)
+    table_index = table_size - torch.div(
+        sample * table_size,
         int(num_steps),
-        device="cpu",
-        dtype=torch.float32,
+        rounding_mode="floor",
     )
+    base = table_index.to(torch.float32) / float(table_size)
     shifted = float(shift_scale) * base / (1 + (float(shift_scale) - 1) * base)
-    shifted, _ = torch.unique_consecutive(shifted, return_counts=True)
-    # A one-point request is still exactly one point.  Normal serving uses
-    # multiple points, but preserving the requested cardinality keeps
-    # ``num_inference_steps`` the sole schedule-size control.
-    if num_steps > 1 and shifted[-1].item() > 0.0:
-        shifted = torch.cat([shifted, torch.tensor([0.0], dtype=shifted.dtype)])
+    shifted = torch.cat([shifted, torch.tensor([0.0], dtype=shifted.dtype)])
     return [float(value) for value in shifted.tolist()]

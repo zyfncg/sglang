@@ -599,6 +599,13 @@ class MiniMaxH3Attention(nn.Module):
         weight = self.qkv_proj.weight
         base_loader = weight.weight_loader
 
+        # The pre-quantized checkpoint is consumed directly by a Linear
+        # followed by a three-way Q/K/V split, so its rows are already
+        # [Q_all | K_all | V_all].  The dense upstream checkpoint uses the
+        # grouped per-head layout handled below.
+        if weight.dtype == torch.int8:
+            return
+
         def _reorder_checkpoint_weight(loaded_weight: torch.Tensor) -> torch.Tensor:
             return _reorder_grouped_qkv_to_qkv(
                 loaded_weight,
@@ -629,6 +636,39 @@ class MiniMaxH3Attention(nn.Module):
             weight.weight_loader = _weight_loader
         # rank-local FSDP must reorder grouped QKV before selecting each shard
         weight.rank_local_weight_transform = _reorder_checkpoint_weight
+
+        # Serialized kitchen_int8 checkpoints carry a per-output-channel scale.
+        # It uses the same grouped QKV row layout as the weight and therefore
+        # must be reordered and TP-sharded in lockstep with it.
+        weight_scale = getattr(self.qkv_proj, "weight_scale", None)
+        if weight_scale is not None:
+            scale_base_loader = getattr(
+                weight_scale, "weight_loader", base_loader
+            )
+
+            def _scale_loader(
+                param: torch.Tensor, loaded_weight: torch.Tensor
+            ) -> None:
+                if _copy_grouped_qkv_tp_shard(
+                    param,
+                    loaded_weight,
+                    num_query_groups=arch.num_attention_heads,
+                    head_dim=arch.attention_head_dim,
+                    tp_rank=self.qkv_proj.tp_rank,
+                    tp_size=self.tp_size,
+                ):
+                    return
+                scale_base_loader(
+                    param, _reorder_checkpoint_weight(loaded_weight)
+                )
+
+            if hasattr(weight_scale, "_weight_loader"):
+                weight_scale._weight_loader = _scale_loader
+            else:
+                weight_scale.weight_loader = _scale_loader
+            weight_scale.rank_local_weight_transform = (
+                _reorder_checkpoint_weight
+            )
 
     def forward(
         self,
@@ -771,6 +811,7 @@ class MiniMaxH3AdalnProj(nn.Module):
         prefix: str,
         expand_ratio: int,
         modality_num: int,
+        input_dim: int | None = None,
     ) -> None:
         super().__init__()
         if out_features != expand_ratio * arch.hidden_size * modality_num:
@@ -782,11 +823,11 @@ class MiniMaxH3AdalnProj(nn.Module):
         self.modality_num = modality_num
         self.hidden_size = arch.hidden_size
         self.linear = ColumnParallelLinear(
-            arch.time_embed_dim,
+            input_dim or arch.time_embed_dim,
             out_features,
             bias=True,
             gather_output=False,
-            params_dtype=_BF16_DTYPE,
+            params_dtype=_FP32_DTYPE if input_dim is not None else _BF16_DTYPE,
             quant_config=quant_config,
             prefix=f"{prefix}.linear",
         )
@@ -1180,6 +1221,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         *,
         prefix: str,
         use_adaln_cache: bool = False,
+        adaln_curve_rank: int | None = None,
     ) -> None:
         super().__init__()
         self.norm1 = _norm(arch.hidden_size, eps=arch.norm_eps)
@@ -1200,6 +1242,7 @@ class MiniMaxH3DiTBlock(nn.Module):
                 prefix=f"{prefix}.adaln_proj",
                 expand_ratio=6,
                 modality_num=MINIMAX_H3_ADALN_MODALITY_NUM,
+                input_dim=adaln_curve_rank,
             )
         )
         self.preserve_input_for_cache_dit = False
@@ -1281,6 +1324,7 @@ class MiniMaxH3FinalLayer(nn.Module):
         *,
         prefix: str,
         use_adaln_cache: bool = False,
+        adaln_curve_rank: int | None = None,
     ) -> None:
         super().__init__()
         video_patch_dim = (
@@ -1300,6 +1344,7 @@ class MiniMaxH3FinalLayer(nn.Module):
                 prefix=f"{prefix}.adaln_proj",
                 expand_ratio=2,
                 modality_num=1,
+                input_dim=adaln_curve_rank,
             )
         )
         self.video_out = ColumnParallelLinear(
@@ -1460,6 +1505,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         adaln_cache_model_variant: str | None = None,
         adaln_weight_files: list[str] | None = None,
         adaln_plan_width: int = MINIMAX_H3_ADALN_MAX_PLAN_WIDTH,
+        adaln_curve_shape: tuple[int, int] | None = None,
     ) -> None:
         super().__init__(config=config, hf_config=hf_config)
         if (
@@ -1471,6 +1517,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         self._adaln_precomputed = (
             adaln_cache_path is not None or adaln_weight_files is not None
         )
+        self._adaln_curve = adaln_curve_shape is not None
         arch = self.config
         self.arch = arch
         self.hidden_size = arch.hidden_size
@@ -1516,10 +1563,17 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             quant_config=quant_config,
             prefix="condition_proj",
         )
-        self.time_embedder = MiniMaxH3TimeEmbedder(
-            arch,
-            prefix="time_embedder",
-        )
+        if adaln_curve_shape is None:
+            self.time_embedder = MiniMaxH3TimeEmbedder(
+                arch,
+                prefix="time_embedder",
+            )
+        else:
+            self.time_embedder = None
+            self.register_buffer(
+                "adaln_t_table",
+                torch.empty(adaln_curve_shape, dtype=_FP32_DTYPE),
+            )
         self.rope = MiniMaxH3Rope(arch.rope_inv_freq_len)
         self.token_refiner = MiniMaxH3TokenRefiner(
             arch,
@@ -1533,6 +1587,9 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                     quant_config,
                     prefix=f"blocks.{index}",
                     use_adaln_cache=self._adaln_precomputed,
+                    adaln_curve_rank=(
+                        adaln_curve_shape[1] if adaln_curve_shape else None
+                    ),
                 )
                 for index in range(arch.num_layers)
             ]
@@ -1543,6 +1600,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             quant_config,
             prefix="final_layer",
             use_adaln_cache=self._adaln_precomputed,
+            adaln_curve_rank=(adaln_curve_shape[1] if adaln_curve_shape else None),
         )
         self.adaln_cache = (
             MiniMaxH3AdalnCache(
@@ -1556,6 +1614,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             else None
         )
         self._resolved_attention_backend: AttentionBackendEnum | None = None
+        self._resolve_attention_backend_once()
         self._mark_missing_params_required()
 
     def set_cache_dit_input_preservation(self, enabled: bool) -> None:
@@ -1593,6 +1652,8 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
 
     def post_load_weights(self) -> None:
         for name in _MINIMAX_H3_FP32_PARAM_NAMES_IN_MODEL_ORDER:
+            if self._adaln_curve and name.startswith("time_embedder."):
+                continue
             param = self.get_parameter(name)
             if param.dtype != _FP32_DTYPE:
                 raise ValueError(
@@ -1854,7 +1915,18 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                 audio_embed.to(_BF16_DTYPE),
             )
 
-        t_emb = self.time_embedder(unique_timesteps)
+        if self._adaln_curve:
+            table = self.adaln_t_table
+            position = unique_timesteps.clamp(0.0, 1.0) * (table.shape[0] - 1)
+            lower = position.floor().long().clamp(max=table.shape[0] - 2)
+            fraction = (position - lower).unsqueeze(-1)
+            t_emb = torch.lerp(
+                table.index_select(0, lower),
+                table.index_select(0, lower + 1),
+                fraction,
+            )
+        else:
+            t_emb = self.time_embedder(unique_timesteps)
         return embeddings, t_emb
 
     def forward(self, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
@@ -2010,7 +2082,11 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             local_embedding_layout=kwargs.get("local_embedding_layout"),
         )
         # request-step AdaLN input shared by all blocks
-        adaln_input = nn.functional.silu(t_emb).to(_BF16_DTYPE)
+        adaln_input = (
+            t_emb.to(_FP32_DTYPE)
+            if self._adaln_curve
+            else nn.functional.silu(t_emb).to(_BF16_DTYPE)
+        )
         inverse_indices = inverse_indices.to(device)
         block_inverse = inverse_indices[row_start:row_stop]
         if block_token_tags is None:

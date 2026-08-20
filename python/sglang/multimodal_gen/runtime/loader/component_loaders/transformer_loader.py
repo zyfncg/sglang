@@ -5,6 +5,7 @@ from contextlib import nullcontext
 from typing import Any
 
 import torch
+from safetensors import safe_open
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
@@ -53,6 +54,19 @@ def _resolve_checkpoint_load_device(
 
 def _minimax_h3_adaln_cache_key_filter(name: str) -> bool:
     return ".adaln_proj.linear." not in name
+
+
+def _minimax_h3_adaln_curve_shape(
+    safetensors_list: list[str],
+) -> tuple[int, int] | None:
+    for path in safetensors_list:
+        with safe_open(path, framework="pt", device="cpu") as checkpoint:
+            if "adaln_t_table" in checkpoint.keys():
+                shape = tuple(checkpoint.get_slice("adaln_t_table").get_shape())
+                if len(shape) != 2 or shape[0] < 2 or shape[1] < 1:
+                    raise ValueError(f"Invalid MiniMax H3 AdaLN curve shape: {shape}")
+                return shape
+    return None
 
 
 def _default_quantized_attention_backend(
@@ -214,6 +228,11 @@ class TransformerLoader(ComponentLoader):
             "hf_config": config,
             "quant_config": quant_spec.runtime_quant_config,
         }
+        if cls_name == "MiniMaxH3DiTModel":
+            curve_shape = _minimax_h3_adaln_curve_shape(safetensors_list)
+            if curve_shape is not None:
+                init_params["adaln_curve_shape"] = curve_shape
+                logger.info("MiniMax H3 pruned AdaLN curve: %s", curve_shape)
         checkpoint_key_filter: Callable[[str], bool] | None = None
         adaln_cache_path = component_server_args.minimax_h3_adaln_cache_path
         if adaln_cache_path is not None:

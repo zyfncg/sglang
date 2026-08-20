@@ -4,7 +4,7 @@
 
 
 import torch
-from sageattention import sageattn
+from sageattention import sageattn_qk_int8_pv_fp16_cuda
 
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (  # FlashAttentionMetadata,
     AttentionBackend,
@@ -78,14 +78,19 @@ class SageAttentionImpl(AttentionImpl):
         *,
         return_softmax_lse: bool = False,
     ) -> torch.Tensor:
-        output = sageattn(
+        # SageAttention 2 auto-selects an FP8-PV kernel on SM120.  That path is
+        # fast, but its accumulated error is too large for long diffusion runs.
+        # Keep Q/K quantized while using the more accurate FP16-PV/FP32 path.
+        output = sageattn_qk_int8_pv_fp16_cuda(
             query,
             key,
             value,
             # since input is (batch_size, seq_len, head_num, head_dim)
             tensor_layout="NHD",
             is_causal=self.causal,
+            qk_quant_gran="per_thread",
             sm_scale=self.softmax_scale,
+            pv_accum_dtype="fp32",
             return_lse=return_softmax_lse,
         )
         if return_softmax_lse:
