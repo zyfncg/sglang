@@ -77,6 +77,9 @@ class KitchenInt8LinearMethod(LinearMethodBase):
 
     def __init__(self, quant_config: KitchenInt8Config) -> None:
         self.quant_config = quant_config
+        self.prequantized = os.environ.get(
+            "SGLANG_KITCHEN_INT8_PREQUANTIZED", "0"
+        ).lower() in {"1", "true", "yes"}
         _load_comfy_kitchen()
 
     def create_weights(
@@ -99,6 +102,29 @@ class KitchenInt8LinearMethod(LinearMethodBase):
                 f"{self.quant_config.group_size}"
             )
 
+        if self.prequantized:
+            weight = Parameter(
+                torch.empty(
+                    sum(output_partition_sizes),
+                    input_size_per_partition,
+                    dtype=torch.int8,
+                ),
+                requires_grad=False,
+            )
+            set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
+            layer.register_parameter("weight", weight)
+            set_weight_attrs(weight, extra_weight_attrs)
+
+            weight_scale = Parameter(
+                torch.empty(
+                    sum(output_partition_sizes), 1, dtype=torch.float32
+                ),
+                requires_grad=False,
+            )
+            set_weight_attrs(weight_scale, {"output_dim": 0})
+            layer.register_parameter("weight_scale", weight_scale)
+            return
+
         # Deliberately identical to UnquantizedLinearMethod: weights load as
         # BF16 through the model's existing loaders (H3 for instance installs a
         # custom qkv loader that reorders the grouped checkpoint layout), and
@@ -120,6 +146,10 @@ class KitchenInt8LinearMethod(LinearMethodBase):
 
         weight = layer.weight.data
         if weight.dtype == torch.int8:  # already processed
+            if not hasattr(layer, "weight_scale"):
+                raise ValueError(
+                    "pre-quantized kitchen_int8 weight is missing weight_scale"
+                )
             return
 
         # Quantization runs on CUDA, but the model may still be staged on CPU

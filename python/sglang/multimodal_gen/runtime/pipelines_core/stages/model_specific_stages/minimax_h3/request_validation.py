@@ -83,9 +83,9 @@ def _validate_target(target: Any, *, profile: MiniMaxH3TaskProfile) -> dict[str,
     # compatibility keys are ignored; only these three declared values are
     # validated and emitted below.
     short_edge = _require_int(target.get("short_edge"), f"{path}.short_edge")
-    if short_edge != 768:
+    if not 768 <= short_edge <= 1024 or short_edge % 32:
         raise ValueError(
-            f"{path}.short_edge must be 768 for minimax_h3, got {short_edge}"
+            f"{path}.short_edge must be a multiple of 32 in [768, 1024], got {short_edge}"
         )
     aspect_ratio = _require_str(target.get("aspect_ratio"), f"{path}.aspect_ratio")
     if profile.aspect_ratio_forced_auto and aspect_ratio != "auto":

@@ -8,6 +8,7 @@ rows stay pinned to their noised step-0 anchors.
 
 from __future__ import annotations
 
+import math
 from contextlib import AbstractContextManager, nullcontext
 from typing import Any, Callable
 
@@ -40,14 +41,35 @@ def _minimax_h3_update_target_rows_(
     sigma_ratio: torch.Tensor,
     one_minus_sigma_ratio: torch.Tensor,
     denoised_scratch: torch.Tensor,
+    old_denoised: torch.Tensor | None = None,
+    sigma_prev: float | None = None,
+    sigma_next: float | None = None,
 ) -> None:
     torch.mul(sigma_t, velocity, out=denoised_scratch)
+    # The validated H3 forward contract returns the negated raw projection, then CONST uses
+    # ``denoised = model_input - model_output * sigma``.  This implementation
+    # returns the raw projection, so the equivalent fused contract is plus.
     torch.add(state, denoised_scratch, out=denoised_scratch)
-    if sigma_curr == 0.0:
-        return
-    torch.mul(one_minus_sigma_ratio, denoised_scratch, out=velocity)
-    torch.mul(sigma_ratio, state, out=state)
-    torch.add(state, velocity, out=state)
+    if old_denoised is None or sigma_next == 0.0:
+        if sigma_curr != 0.0:
+            torch.mul(one_minus_sigma_ratio, denoised_scratch, out=velocity)
+            torch.mul(sigma_ratio, state, out=state)
+            torch.add(state, velocity, out=state)
+    else:
+        if sigma_prev is None or sigma_next is None:
+            raise ValueError("res_multistep requires adjacent sigma values")
+        # Use the validated res_multistep eta=0 update. The first and final
+        # steps use Euler; interior steps combine the current and previous
+        # denoised predictions with the second-order DPM-Solver++ formula.
+        h = math.log(sigma_curr / sigma_next)
+        c2 = math.log(sigma_curr / sigma_prev) / h
+        phi1 = math.expm1(-h) / -h
+        phi2 = (phi1 - 1.0) / -h
+        b1 = phi1 - phi2 / c2
+        b2 = phi2 / c2
+        torch.mul(sigma_ratio, state, out=state)
+        state.add_(denoised_scratch, alpha=h * b1)
+        state.add_(old_denoised, alpha=h * b2)
 
 
 def _build_local_embedding_layout(
@@ -466,6 +488,8 @@ def minimax_h3_denoise_loop(
     audio_one_minus_sigma_ratios = 1.0 - audio_sigma_ratios
     video_denoised_scratch = torch.empty_like(video_rows[video_target_slice])
     audio_denoised_scratch = torch.empty_like(audio_rows[audio_target_slice])
+    old_video_denoised = torch.empty_like(video_denoised_scratch)
+    old_audio_denoised = torch.empty_like(audio_denoised_scratch)
     for step in range(num_steps):
         step_cm = step_profiler(step) if step_profiler is not None else nullcontext()
         with step_cm:
@@ -497,7 +521,11 @@ def minimax_h3_denoise_loop(
                     sigma_ratio=video_sigma_ratios[step],
                     one_minus_sigma_ratio=video_one_minus_sigma_ratios[step],
                     denoised_scratch=video_denoised_scratch,
+                    old_denoised=old_video_denoised if step else None,
+                    sigma_prev=sigmas_video[step - 1] if step else None,
+                    sigma_next=sigmas_video[step + 1],
                 )
+                old_video_denoised.copy_(video_denoised_scratch)
 
                 audio_target = audio_rows[audio_target_slice]
                 _minimax_h3_update_target_rows_(
@@ -508,7 +536,11 @@ def minimax_h3_denoise_loop(
                     sigma_ratio=audio_sigma_ratios[step],
                     one_minus_sigma_ratio=audio_one_minus_sigma_ratios[step],
                     denoised_scratch=audio_denoised_scratch,
+                    old_denoised=old_audio_denoised if step else None,
+                    sigma_prev=sigmas_audio[step - 1] if step else None,
+                    sigma_next=sigmas_audio[step + 1],
                 )
+                old_audio_denoised.copy_(audio_denoised_scratch)
             if on_step is not None:
                 on_step(step, video_rows, audio_rows)
 
