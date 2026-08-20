@@ -78,6 +78,29 @@ def _backfill_ltx2_audio_vae_latent_stats(
         loaded["latents_std"] = loaded[std_key]
 
 
+def _convert_minimax_h3_audio_vae_weights(
+    loaded: dict[str, torch.Tensor], vae: nn.Module
+) -> None:
+    """Adapt materialized weight_norm tensors to native PyTorch keys."""
+    original1_suffix = ".parametrizations.weight.original1"
+    for original1_key in tuple(vae.state_dict()):
+        if not original1_key.endswith(original1_suffix):
+            continue
+        weight_key = original1_key[: -len(original1_suffix)] + ".weight"
+        weight = loaded.pop(weight_key, None)
+        if weight is None:
+            continue
+        original0_key = original1_key[: -len("original1")] + "original0"
+        norm_dims = tuple(range(1, weight.ndim))
+        norm = (
+            torch.linalg.vector_norm(weight.float(), dim=norm_dims, keepdim=True)
+            if norm_dims
+            else weight.float().abs()
+        )
+        loaded[original0_key] = norm.to(weight.dtype)
+        loaded[original1_key] = weight
+
+
 def _convert_conv3d_weights_to_channels_last_3d(module: nn.Module) -> int:
     """
     Convert Conv3d weights to channels_last_3d (NDHWC) memory format.
@@ -241,6 +264,13 @@ class VAELoader(ComponentLoader):
         for sf_path in safetensors_list:
             loaded.update(safetensors_load_file(sf_path))
         _backfill_ltx2_audio_vae_latent_stats(loaded, component_name)
+        if class_name == "MiniMaxH3AudioVAE":
+            _convert_minimax_h3_audio_vae_weights(loaded, vae)
+        if class_name in {"MiniMaxH3AudioVAE", "MiniMaxH3VideoVAE"}:
+            state_keys = set(vae.state_dict())
+            for key in ("latents_mean", "latents_std"):
+                if key not in state_keys:
+                    loaded.pop(key, None)
         strict_load = native_only
         vae.load_state_dict(
             loaded,
